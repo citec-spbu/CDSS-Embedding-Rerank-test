@@ -19,7 +19,11 @@ logger = logging.getLogger(__name__)
 class RerankModel:
     """Переранжирование пар текстов на основе кросс-энкодера"""
 
-    def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-12-v2", max_workers: int = conf.MAX_WORKERS):
+    def __init__(
+        self,
+        model_name: str = "cross-encoder/ms-marco-MiniLM-L-12-v2",
+        max_workers: int = conf.MAX_WORKERS,
+    ):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         self.max_workers = max_workers
@@ -30,37 +34,47 @@ class RerankModel:
             logger.info("Используется %s, max_workers=%d", self.device, max_workers)
         except Exception as e:
             raise RuntimeError(f"Ошибка при загрузке модели: {e}")
-        
-    async def rerank_async(self, query: str, passages: list[str], timeout: float = conf.RERANK_TIMEOUT) -> list[tuple[str, float]]:
+
+    async def rerank_async(
+        self, query: str, passages: list[str], timeout: float = conf.RERANK_TIMEOUT
+    ) -> list[tuple[str, float]]:
         """Асинхронное переранжирование с timeout"""
         logger.info("Переранжирование %d пар текстов", len(passages))
-        
+
         loop = asyncio.get_event_loop()
-        
+
         try:
             # Запускаем в thread pool чтобы не блокировать event loop
             scores = await asyncio.wait_for(
                 loop.run_in_executor(
-                    self.thread_pool, 
-                    lambda: self.model.predict([[query, passage] for passage in passages])
+                    self.thread_pool,
+                    lambda: self.model.predict(
+                        [[query, passage] for passage in passages]
+                    ),
                 ),
-                timeout=timeout
+                timeout=timeout,
             )
-            
-            # Нормализация scores
-            normalized_scores = self._normalize_scores(scores)
-            
-            sorted_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+
+            # Нормализация scores(new ver)
+            normalized_scores = self._normalize_scores_adaptive(scores)
+
+            sorted_indices = sorted(
+                range(len(scores)), key=lambda i: scores[i], reverse=True
+            )
             logger.info("Переранжирование завершено")
-            
+
             return [
                 (passages[i], float(normalized_scores[i]))
                 for i in sorted_indices
                 if float(normalized_scores[i]) != 0
             ]
-            
+
         except asyncio.TimeoutError:
-            logger.error("Timeout при переранжировании %d пар за %.1f сек", len(passages), timeout)
+            logger.error(
+                "Timeout при переранжировании %d пар за %.1f сек",
+                len(passages),
+                timeout,
+            )
             raise HTTPException(status_code=504, detail="Timeout при переранжировании")
         except Exception as e:
             logger.error("Ошибка при переранжировании: %s", e)
@@ -76,9 +90,35 @@ class RerankModel:
             normalized_scores = np.clip(normalized_scores, 0, 1)
         else:
             normalized_scores = np.ones_like(scores) * 0.5
-            
+
         return normalized_scores
 
+    def _normalize_scores_adaptive(self, logits):
+        """Адаптируется к распределению логитов"""
+        logits = np.array(logits)
+
+        # Анализируем распределение
+        mean = np.mean(logits)
+        std = np.std(logits)
+        skew = np.mean(((logits - mean) / std) ** 3) if std > 0 else 0
+
+        if abs(skew) < 0.5 and std > 0.5:
+            # Нормальное распределение - используем сигмоиду
+            normalized = 1 / (1 + np.exp(-(logits - mean) / std))
+        elif std < 0.1:
+            # Малая дисперсия - rank-based подход
+            ranks = np.argsort(np.argsort(logits))
+            normalized = ranks / len(ranks)
+        else:
+            # Асимметричное распределение - квантильный метод
+            q25, q75 = np.percentile(logits, [25, 75])
+            if q75 > q25:
+                normalized = (logits - q25) / (q75 - q25)
+                normalized = np.clip(normalized, 0, 1)
+            else:
+                normalized = np.ones_like(logits) * 0.5
+
+        return normalized
 
     def rerank(self, query: str, passages: list[str]) -> list[tuple[str, float]]:
         """Переранжировать пары текстов на основе кросс-энкодера"""
